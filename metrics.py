@@ -100,7 +100,10 @@ def compute_weighted_assortativity(C, fine_labels, class_to_superclass):
     :return: Weighted assortativity coefficient.
     """
     E = calculate_association_matrix(C, fine_labels, class_to_superclass)
-    r = (np.sum(np.diag(E))-np.linalg.norm(E)**2)/(1-np.linalg.norm(E)**2)
+    a = E.sum(axis=1)  
+    b = E.sum(axis=0)   
+    expected = a @ b    
+    r = (np.trace(E) - expected) / (1 - expected)
     return r
 
 def compute_modularity_louvain(G: nx.DiGraph) -> float:

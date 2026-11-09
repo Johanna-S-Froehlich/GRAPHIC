@@ -53,7 +53,6 @@ torchinfo==1.8.0
 timm==1.0.19
 torch==2.7.1
 torchaudio==2.7.1
-torchinfo==1.8.0
 torchvision==0.22.1
 tqdm==4.67.1
 transformers==4.48.2

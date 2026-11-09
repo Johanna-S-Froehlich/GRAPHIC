@@ -17,5 +17,5 @@ checkpoints_dir=vit_checkpoints_tiny
 output_dir=vit_conf_matrices_tiny
 
 # Run confusion matrix
-python conf_matrices_vit.py --checkpoint_dir $checkpoints_dir --output_dir $output_dir --model $model --start_index $start_index --end_index $end_index --alpha "$alpha" --num_classes 200 --dataset tinyimagenet --depth "$depth" --weight_decay
+python confusion_matrices_vit.py --checkpoint_dir $checkpoints_dir --output_dir $output_dir --model $model --start_index $start_index --end_index $end_index --alpha "$alpha" --num_classes 200 --dataset tinyimagenet --depth "$depth" --weight_decay
 

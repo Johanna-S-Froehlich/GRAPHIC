@@ -13,7 +13,7 @@ class ActivationDataset(Dataset):
         """
         self.activations = activations
         self.labels = labels.long()
-        self.pred_labels = pred_labels.long()
+        self.pred_labels = pred_labels.long() if pred_labels is not None else None
 
     def __len__(self):
         return len(self.activations)

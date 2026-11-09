@@ -1,8 +1,5 @@
-import timm
-import os
 import torch.nn as nn
 from torch import Tensor
-from huggingface_hub import hf_hub_download
 from typing import Any, Optional, Callable, List, Type
 import torch
 
@@ -358,7 +355,7 @@ def resnet50(**kwargs: Any) -> ResNet:
     """
     return _resnet(Bottleneck, [3, 4, 6, 3], **kwargs)
 
-def create_resnet(num_classes: int, model_name: str = "resnet50", dropout: float = 0.2):
+def create_resnet(num_classes: int, model_name: str = "resnet50"):
     """
     Factory function to create a ResNet model for classification with a specified number of classes.
 
@@ -366,12 +363,10 @@ def create_resnet(num_classes: int, model_name: str = "resnet50", dropout: float
         num_classes (int): The number of classes for the classification task.
         model_name (str, optional): The model variant to create. Currently, only "resnet50" is supported.
                                     Defaults to "resnet50".
-        dropout (float, optional): Dropout rate (provided for compatibility, but not used in this function).
-                                   Defaults to 0.2.
-    
+
     Returns:
         ResNet: The constructed ResNet model configured for the given number of classes.
-    
+
     Raises:
         ValueError: If an invalid model name is provided.
     """
@@ -379,35 +374,4 @@ def create_resnet(num_classes: int, model_name: str = "resnet50", dropout: float
         model = resnet50(num_classes=num_classes)
     else:
         raise ValueError("Invalid model name.")
-    return model
-
-def create_resnet_cifar100_hf():
-    """
-    Creates a ResNet-50 model pre-trained on CIFAR-100 from the HuggingFace Hub.
-
-    This function checks if the pre-trained model weights exist locally; if not, it downloads them using
-    hf_hub_download. It then creates the model using timm, modifies the first convolution layer to better
-    suit CIFAR-100 image dimensions (3x3 kernel, stride 1, padding 1), and finally loads the pretrained
-    state dictionary.
-
-    Returns:
-        torch.nn.Module: A ResNet-50 model pre-trained on CIFAR-100.
-    """
-    # Check if the model weights file exists locally; if not, download it.
-    if not os.path.isfile("./data/models/resnet50_cifar100_hf/pytorch_model.bin"):
-        hf_hub_download(
-            repo_id="edadaltocg/resnet50_cifar100",
-            filename="pytorch_model.bin",
-            local_dir="./data/models/resnet50_cifar100_hf"
-        )
-    # Create the model using timm. 'pretrained=False' because we'll load our own weights.
-    model = timm.create_model("hf_hub:edadaltocg/resnet50_cifar100", pretrained=False)
-    
-    # Modify the first convolutional layer to use a 3x3 kernel with stride 1 and padding 1,
-    # which is typically preferred for CIFAR-100 images.
-    model.conv1 = torch.nn.Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
-    
-    # Load the pre-trained weights from the local file.
-    model.load_state_dict(torch.load("./data/models/resnet50_cifar100_hf/pytorch_model.bin"))
-    
     return model

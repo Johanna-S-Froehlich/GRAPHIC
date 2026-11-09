@@ -1,5 +1,6 @@
 import argparse
 import glob
+import importlib
 import json
 import os
 
@@ -10,29 +11,19 @@ import matplotlib.pyplot as plt
 from utils import file_matrix
 
 
-def create_fine_labels_for_coarse_categories(mapping_superclass_fine, mapping_make_superclass):
-    """
-    Creates a new dictionary where the keys are 'natural' and 'man-made',
-    and the values are the fine labels corresponding to the superclasses in those categories.
+# Per-dataset configuration: which mappings module to import and the graph
+# plot canvas size that best fits that many class labels.
+DATASET_CONFIG = {
+    "cifar100": {
+        "mappings_module": "cifar100_mappings",
+        "graph_figsize": (16, 12),
+    },
+    "tiny-imagenet": {
+        "mappings_module": "tinyimagenet_mappings",
+        "graph_figsize": (32, 24),
+    },
+}
 
-    :param mapping_superclass_fine: Dictionary mapping superclasses to fine labels.
-    :param mapping_make_superclass: Dictionary mapping coarse categories to superclasses.
-    :return: New dictionary with 'natural' and 'man-made' as keys, and fine labels as values.
-    """
-    fine_labels_for_coarse = {}
-
-    # Iterate over the coarse categories ('natural', 'man-made')
-    for coarse_group, superclasses in mapping_make_superclass.items():
-        # Initialize the list to hold fine labels for the current coarse category
-        fine_labels_for_coarse[coarse_group] = []
-
-        # For each superclass in the list of superclasses for this coarse category
-        for superclass in superclasses:
-            # Retrieve fine labels for the current superclass from mapping_superclass_fine
-            if superclass in mapping_superclass_fine:
-                fine_labels_for_coarse[coarse_group].extend(mapping_superclass_fine[superclass])
-
-    return fine_labels_for_coarse
 
 def calculate_association_matrix(C, fine_labels, fine_to_group_dict):
     """
@@ -106,22 +97,23 @@ def compute_weighted_assortativity(C, fine_labels, class_to_superclass):
     r = (np.trace(E) - expected) / (1 - expected)
     return r
 
-def compute_modularity_louvain(G: nx.DiGraph) -> float:
+def compute_modularity_louvain(G: nx.DiGraph, seed: int = None) -> float:
     """
     Computes the modularity of a graph using the Louvain modularity optimization method.
 
-    Modularity is a measure of the structure of networks or graphs. It quantifies the strength of division 
+    Modularity is a measure of the structure of networks or graphs. It quantifies the strength of division
     of a graph into clusters (communities), where higher values indicate better-defined community structure.
 
     Args:
         G: nx.DiGraph: A directed graph.
-    
+        seed (optional): random seed for Louvain; None gives a different partition on each run.
+
     Returns:
         float: The computed modularity value, a measure of the quality of the graph's community structure.
 
     """
     # Modularity using Louvain modularity communities
-    communities= nx.algorithms.community.louvain_communities(G, weight='weight')
+    communities= nx.algorithms.community.louvain_communities(G, weight='weight', seed=seed)
     modularity_louv  = nx.algorithms.community.modularity(G, communities, weight='weight')
     return modularity_louv, communities
 
@@ -243,7 +235,9 @@ def compute_community_layout(G, communities, radius=50.0, seed=42):
 def average_color(c1, c2):
     return tuple((np.array(c1) + np.array(c2)) / 2)
 
-def plot_graph(G: nx.DiGraph, filepath: str, communities: list[list[int]]=None, colors_communities: list[list[float]]=None, title: str=None, node_names: list[str]=None):
+def plot_graph(G: nx.DiGraph, filepath: str, communities: list[list[int]]=None,
+               colors_communities: list[list[float]]=None, title: str=None,
+               node_names: list[str]=None, figsize: tuple[int, int]=(16, 12)):
     """Plot a picture of a graph and store it a defined place.
     Args:
         G: Graph to be plotted.
@@ -251,6 +245,8 @@ def plot_graph(G: nx.DiGraph, filepath: str, communities: list[list[int]]=None, 
         communities (optional): indicated the identified communities by color. Leave None for detection of communities by modularity.
         colors_communities (optional): list of colors for each community, if None, random colors will be used.
         title (optional): title of the graph
+        figsize (optional): matplotlib figure size; larger values fit more
+            labels (use (32, 24) for ~200-class datasets like Tiny ImageNet).
     """
 
     node_colors = {}
@@ -275,7 +271,7 @@ def plot_graph(G: nx.DiGraph, filepath: str, communities: list[list[int]]=None, 
 
 
     # Plot the graph
-    plt.figure(figsize=(16, 12))
+    plt.figure(figsize=figsize)
     plt.axis('off')  # Turn off the axis
     nx.draw_networkx_nodes(G, pos=pos, node_size=500, node_color=node_color_array)
     nx.draw_networkx_labels(G, pos=pos, font_size=10, font_color='black')
@@ -308,186 +304,56 @@ def plot_graph(G: nx.DiGraph, filepath: str, communities: list[list[int]]=None, 
     # Save the plot as a PDF file
     plt.savefig(filepath)
 
-# Fine labels as provided in the CIFAR-100 dataset
-fine_labels = [
-    'apple',              # id 0
-    'aquarium_fish',      # id 1
-    'baby',               # id 2
-    'bear',               # id 3
-    'beaver',             # id 4
-    'bed',                # id 5
-    'bee',                # id 6
-    'beetle',             # id 7
-    'bicycle',            # id 8
-    'bottle',             # id 9
-    'bowl',               # id 10
-    'boy',                # id 11
-    'bridge',             # id 12
-    'bus',                # id 13
-    'butterfly',          # id 14
-    'camel',              # id 15
-    'can',                # id 16
-    'castle',             # id 17
-    'caterpillar',        # id 18
-    'cattle',             # id 19
-    'chair',              # id 20
-    'chimpanzee',         # id 21
-    'clock',              # id 22
-    'cloud',              # id 23
-    'cockroach',          # id 24
-    'couch',              # id 25
-    'crab',               # id 26
-    'crocodile',          # id 27
-    'cup',                # id 28
-    'dinosaur',           # id 29
-    'dolphin',            # id 30
-    'elephant',           # id 31
-    'flatfish',           # id 32
-    'forest',             # id 33
-    'fox',                # id 34
-    'girl',               # id 35
-    'hamster',            # id 36
-    'house',              # id 37
-    'kangaroo',           # id 38
-    'computer_keyboard',  # id 39
-    'lamp',               # id 40
-    'lawn_mower',         # id 41
-    'leopard',            # id 42
-    'lion',               # id 43
-    'lizard',             # id 44
-    'lobster',            # id 45
-    'man',                # id 46
-    'maple_tree',         # id 47
-    'motorcycle',         # id 48
-    'mountain',           # id 49
-    'mouse',              # id 50
-    'mushroom',           # id 51
-    'oak_tree',           # id 52
-    'orange',             # id 53
-    'orchid',             # id 54
-    'otter',              # id 55
-    'palm_tree',          # id 56
-    'pear',               # id 57
-    'pickup_truck',       # id 58
-    'pine_tree',          # id 59
-    'plain',              # id 60
-    'plate',              # id 61
-    'poppy',              # id 62
-    'porcupine',          # id 63
-    'possum',             # id 64
-    'rabbit',             # id 65
-    'raccoon',            # id 66
-    'ray',                # id 67
-    'road',               # id 68
-    'rocket',             # id 69
-    'rose',               # id 70
-    'sea',                # id 71
-    'seal',               # id 72
-    'shark',              # id 73
-    'shrew',              # id 74
-    'skunk',              # id 75
-    'skyscraper',         # id 76
-    'snail',              # id 77
-    'snake',              # id 78
-    'spider',             # id 79
-    'squirrel',           # id 80
-    'streetcar',          # id 81
-    'sunflower',          # id 82
-    'sweet_pepper',       # id 83
-    'table',              # id 84
-    'tank',               # id 85
-    'telephone',          # id 86
-    'television',         # id 87
-    'tiger',              # id 88
-    'tractor',            # id 89
-    'train',              # id 90
-    'trout',              # id 91
-    'tulip',              # id 92
-    'turtle',             # id 93
-    'wardrobe',           # id 94
-    'whale',              # id 95
-    'willow_tree',        # id 96
-    'wolf',               # id 97
-    'woman',              # id 98
-    'worm',               # id 99
-]
 
-# Mapping from superclasses to fine labels
-mapping_superclass_fine = {
-    'aquatic mammals': ['beaver', 'dolphin', 'otter', 'seal', 'whale'],                                     # 0
-    'fish': ['aquarium_fish', 'flatfish', 'ray', 'shark', 'trout'],                                         # 1
-    'flowers': ['orchid', 'poppy', 'rose', 'sunflower', 'tulip'],                                           # 2
-    'food containers': ['bottle', 'bowl', 'can', 'cup', 'plate'],                                           # 3
-    'fruit and vegetables': ['apple', 'mushroom', 'orange', 'pear', 'sweet_pepper'],                        # 4
-    'household electrical device': ['clock', 'computer_keyboard', 'lamp', 'telephone', 'television'],       # 5
-    'household furniture': ['bed', 'chair', 'couch', 'table', 'wardrobe'],                                  # 6
-    'insects': ['bee', 'beetle', 'butterfly', 'caterpillar', 'cockroach'],                                  # 7
-    'large carnivores': ['bear', 'leopard', 'lion', 'tiger', 'wolf'],                                       # 8
-    'large man-made outdoor things': ['bridge', 'castle', 'house', 'road', 'skyscraper'],                   # 9
-    'large natural outdoor scenes': ['cloud', 'forest', 'mountain', 'plain', 'sea'],                        # 10
-    'large omnivores and herbivores': ['camel', 'cattle', 'chimpanzee', 'elephant', 'kangaroo'],            # 11
-    'medium-sized mammals': ['fox', 'porcupine', 'possum', 'raccoon', 'skunk'],                             # 12
-    'non-insect invertebrates': ['crab', 'lobster', 'snail', 'spider', 'worm'],                             # 13
-    'people': ['baby', 'boy', 'girl', 'man', 'woman'],                                                      # 14
-    'reptiles': ['crocodile', 'dinosaur', 'lizard', 'snake', 'turtle'],                                     # 15
-    'small mammals': ['hamster', 'mouse', 'rabbit', 'shrew', 'squirrel'],                                   # 16
-    'trees': ['maple_tree', 'oak_tree', 'palm_tree', 'pine_tree', 'willow_tree'],                           # 17
-    'vehicles 1': ['bicycle', 'bus', 'motorcycle', 'pickup_truck', 'train'],                                # 18
-    'vehicles 2': ['lawn_mower', 'rocket', 'streetcar', 'tank', 'tractor'],                                 # 19
-}
+def _plot_metric_over_epochs(metric_key: str, title: str, ylabel: str, output_path: str,
+                             metrics_dict, epochs, layers, iterations):
+    """Helper: plot one scalar metric averaged over iterations, one line per layer."""
+    values = np.array([[[metrics_dict[epoch][layer][iteration][metric_key]
+                         for iteration in iterations] for layer in layers] for epoch in epochs])
+    avg = np.mean(values, axis=2)
+    plt.figure(figsize=(10, 6))
+    for i, layer in enumerate(layers):
+        plt.plot(epochs, avg[:, i], label=f'Layer {layer}')
+    plt.title(title)
+    plt.xlabel('Epochs')
+    plt.ylabel(ylabel)
+    plt.legend(loc='upper left')
+    plt.savefig(output_path)
 
-# Mapping from make to superclasses
-mapping_make_superclass = {
-    'natural': ['aquatic mammals', 'fish', 'flowers', 'fruit and vegetables', 'insects', 'large carnivores',                
-    'large natural outdoor scenes', 'large omnivores and herbivores', 'medium-sized mammals', 'non-insect invertebrates',
-    'people', 'reptiles', 'small mammals', 'trees'],                                                                        
-    'man-made': ['food containers', 'household electrical device', 'household furniture', 'large man-made outdoor things',  
-    'vehicles 1', 'vehicles 2'],                                                                                            
-}
 
-mapping_intuitive_fine = {
-    'animal on land': [ 'bee', 'beetle', 'butterfly', 'caterpillar', 'cockroach', 'bear', 'leopard', 'lion', 'tiger', 'wolf', 'camel', 'cattle', 'chimpanzee', 'elephant', 'kangaroo', 'fox', 'porcupine', 'possum', 'raccoon', 'skunk', 'snail', 'spider', 'worm', 'dinosaur', 'lizard', 'snake', 'hamster', 'mouse', 'rabbit', 'shrew', 'squirrel'],
-    'animal in water': ['crab', 'lobster', 'beaver', 'dolphin', 'otter', 'seal', 'whale', 'aquarium_fish', 'flatfish', 'ray', 'shark', 'trout', 'crocodile', 'turtle'],
-    'people': ['baby', 'boy', 'girl', 'man', 'woman'],
-    'home stuff': ['bottle', 'bowl', 'can', 'cup', 'plate', 'clock', 'computer_keyboard', 'lamp', 'telephone', 'television', 'bed', 'chair', 'couch', 'table', 'wardrobe', 'bicycle', 'bus', 'motorcycle', 'pickup_truck', 'train', 'lawn_mower', 'rocket', 'streetcar', 'tank', 'tractor'],
-    'outside structures': ['cloud', 'forest', 'mountain', 'plain', 'sea',  'bridge', 'castle', 'house', 'road', 'skyscraper'],
-    'plants': ['orchid', 'poppy', 'rose', 'sunflower', 'tulip', 'apple', 'mushroom', 'orange', 'pear', 'sweet_pepper', 'maple_tree', 'oak_tree', 'palm_tree', 'pine_tree', 'willow_tree'],
-}
-
-# Mapping fine labels to indices
-label_to_index = {label: idx for idx, label in enumerate(fine_labels)}
-
-# Replace class names with indices
-superclass_communities = [
-    [label_to_index[fine_label] for fine_label in fine_list]
-    for fine_list in mapping_superclass_fine.values()
-]
-
-mappings = {
-"superclass_fine": mapping_superclass_fine,
-"intuitive_fine": mapping_intuitive_fine,
-"make_superclass": create_fine_labels_for_coarse_categories(mapping_superclass_fine, mapping_make_superclass),
-}
-
-# Main Script  
+# Main Script
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Calculate target metrics for confusion matrices.')
     parser.add_argument('--matrix-dir', type=str, required=True,
                         help='Directory containing the confusion matrix files.')
-    parser.add_argument('--output-dir', type=str, required=True, help='Directory to save the output metrics/plots.')                      
-    parser.add_argument('--alpha', type=float, help='The parameter determining the cross entropy mix between true and predicted labels.', default=1.0)
+    parser.add_argument('--output-dir', type=str, required=True,
+                        help='Directory to save the output metrics/plots.')
+    parser.add_argument('--dataset', type=str, default='cifar100',
+                        choices=sorted(DATASET_CONFIG.keys()),
+                        help='Dataset whose class metadata to use. Tiny ImageNet '
+                             'has no class hierarchy, so assortativity is skipped.')
+    parser.add_argument('--alpha', type=float, default=1.0,
+                        help='The parameter determining the cross entropy mix between true and predicted labels.')
     parser.add_argument('--train-set', action='store_true', help='Use training set confusion matrices.')
     parser.add_argument('--plot-metrics', action='store_true', help='Plot metrics after computation.')
     parser.add_argument('--plot-graphs', action='store_true', help='Plot graphs according to modularity communities.')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for the Louvain community detection.')
     args = parser.parse_args()
+
+    config = DATASET_CONFIG[args.dataset]
+    mappings_mod = importlib.import_module(config["mappings_module"])
+    fine_labels = mappings_mod.fine_labels
+    # Only datasets with a hierarchy expose ``mappings`` (one dict per grouping).
+    dataset_mappings = getattr(mappings_mod, "mappings", None)
+    has_hierarchy = dataset_mappings is not None
+    num_classes = len(fine_labels)
 
     output_dir = os.path.join(args.output_dir, f"alpha_{args.alpha}")
     os.makedirs(output_dir, exist_ok=True)
 
     matrix_dir = os.path.join(args.matrix_dir, f"alpha_{args.alpha}")
-    matrix_files = glob.glob(f"{matrix_dir}/*.npy")
-
     matrix_files = glob.glob(f"{matrix_dir}/*.npy")
     if not matrix_files:
         raise FileNotFoundError(f"No confusion matrix files found in {matrix_dir}")
@@ -501,7 +367,7 @@ if __name__ == "__main__":
 
     if args.plot_graphs:
         graph_dir = os.path.join(args.output_dir, f"alpha_{args.alpha}", "graphs")
-        colors = community_colors(100)
+        colors = community_colors(num_classes)
 
     # Iterate through epochs, iterations, and layers
     for (i, epoch) in enumerate(epochs):
@@ -509,9 +375,8 @@ if __name__ == "__main__":
         for (j, layer) in enumerate(layers):
             metrics[epoch][layer] = {}
             for (k, iteration) in enumerate(iterations):
-                metrics[epoch][layer][iteration] = {}
                 # Get the confusion matrix file for the current epoch, layer, and iteration
-                matrix_file = fm[i, k, j, split_index]  # Use test set confusion matrix
+                matrix_file = fm[i, k, j, split_index]
 
                 C = np.load(matrix_file)
                 if C.ndim != 2 or C.shape[0] != C.shape[1]:
@@ -522,43 +387,42 @@ if __name__ == "__main__":
                 # Create graph from the matrix.
                 G_directed = nx.from_numpy_array(C_directed, create_using=nx.DiGraph())
 
-                modularity_louvain, communities_louvain = compute_modularity_louvain(G_directed)
-                assort_nat_man = compute_weighted_assortativity(C_directed, fine_labels, mappings["make_superclass"])
-                assort_super = compute_weighted_assortativity(C_directed, fine_labels, mappings["superclass_fine"])
-                assort_intuitive = compute_weighted_assortativity(C_directed, fine_labels, mappings["intuitive_fine"])
+                modularity_louvain, communities_louvain = compute_modularity_louvain(G_directed, seed=args.seed)
                 accuracy = calculate_accuracy_score(C)
+
+                entry = {
+                    "modularity_louvain": float(modularity_louvain),
+                    "nr_communities_louvain": int(len(communities_louvain)),
+                    "accuracy": float(accuracy),
+                }
+
+                if has_hierarchy:
+                    entry["assort_nat_man"] = float(compute_weighted_assortativity(
+                        C_directed, fine_labels, dataset_mappings["make_superclass"]))
+                    entry["assort_super"] = float(compute_weighted_assortativity(
+                        C_directed, fine_labels, dataset_mappings["superclass_fine"]))
+                    entry["assort_intuitive"] = float(compute_weighted_assortativity(
+                        C_directed, fine_labels, dataset_mappings["intuitive_fine"]))
+
+                metrics[epoch][layer][iteration] = entry
 
                 if args.plot_graphs:
                     file_path = os.path.join(graph_dir, f'epoch_{epochs[i]}_iteration_{iterations[k]}_layer_{layers[j]}.svg')
                     os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                    plot_graph(G_directed, filepath=file_path, communities=communities_louvain, colors_communities=colors,
-                    title=f'Epoch {epochs[i]} Iteration {iterations[k]} Layer {layers[j]}', node_names=fine_labels)
-
-
-
-                metrics[epoch][layer][iteration] = {
-                    "modularity_louvain": float(modularity_louvain),
-                    "nr_communities_louvain": int(len(communities_louvain)),
-                    "assort_nat_man": float(assort_nat_man),
-                    "assort_super": float(assort_super),
-                    "assort_intuitive": float(assort_intuitive),
-                    "accuracy": float(accuracy)
-                }
+                    plot_graph(G_directed, filepath=file_path, communities=communities_louvain,
+                               colors_communities=colors,
+                               title=f'Epoch {epochs[i]} Iteration {iterations[k]} Layer {layers[j]}',
+                               node_names=fine_labels, figsize=config["graph_figsize"])
 
                 print("=== Graph Analysis Metrics ===")
                 print(f"Epoch: {epoch}, Layer: {layer}, Iteration: {iteration}")
-
-                # Modularity (Louvain)
                 print(f"Modularity (Louvain): {modularity_louvain:.4f}")
                 print(f"Number of Louvain Communities: {len(communities_louvain)}\n")
-
-                # Assortativity Coefficients
-                print("Assortativity Coefficients:")
-                print(f"  Natural vs. Manmade: {assort_nat_man:.4f}")
-                print(f"  Superclass Groups: {assort_super:.4f}")
-                print(f"  Intuitive Groups: {assort_intuitive:.4f}\n")
-
-                # Accuracy
+                if has_hierarchy:
+                    print("Assortativity Coefficients:")
+                    print(f"  Natural vs. Manmade: {entry['assort_nat_man']:.4f}")
+                    print(f"  Superclass Groups: {entry['assort_super']:.4f}")
+                    print(f"  Intuitive Groups: {entry['assort_intuitive']:.4f}\n")
                 print(f"Accuracy: {accuracy:.4f}")
 
 
@@ -568,56 +432,24 @@ if __name__ == "__main__":
         json.dump(metrics, f, indent=4)
 
     if args.plot_metrics:
-        # Plot the metrics for all layers averaged over iterations across epochs
-        # Modularity (Louvain)
-        modularity_values = np.array([[[metrics[epoch][layer][iteration]["modularity_louvain"]
-                                       for iteration in iterations] for layer in layers] for epoch in epochs])
-        avg_modularity = np.mean(modularity_values, axis=2)
-        plt.figure(figsize=(10, 6))
-        for i, layer in enumerate(layers):
-            plt.plot(epochs, avg_modularity[:, i], label=f'Layer {layer}')
-        plt.title('Average Modularity (Louvain) Across Epochs')
-        plt.xlabel('Epochs')
-        plt.ylabel('Modularity (Louvain)')
-        plt.legend(loc='upper left')
-        plt.savefig(f"{output_dir}/modularity_louvain.png")
-
-        # Assortativity Coefficients
-        # Manmade
-        assortativity_values = np.array([[[metrics[epoch][layer][iteration]["assort_nat_man"]
-                                       for iteration in iterations] for layer in layers] for epoch in epochs])
-        avg_assortativity = np.mean(assortativity_values, axis=2)
-        plt.figure(figsize=(10, 6))
-        for i, layer in enumerate(layers):
-            plt.plot(epochs, avg_assortativity[:, i], label=f'Layer {layer}')
-        plt.title('Average Assortativity (Natural vs. Manmade) Across Epochs')
-        plt.xlabel('Epochs')
-        plt.ylabel('Assortativity (Natural vs. Manmade)')
-        plt.legend(loc='upper left')
-        plt.savefig(f"{output_dir}/assortativity_nat_man.png")
-
-        # Superclass
-        assortativity_super_values = np.array([[[metrics[epoch][layer][iteration]["assort_super"]
-                                       for iteration in iterations] for layer in layers] for epoch in epochs])
-        avg_assortativity_super = np.mean(assortativity_super_values, axis=2)
-        plt.figure(figsize=(10, 6))
-        for i, layer in enumerate(layers):
-            plt.plot(epochs, avg_assortativity_super[:, i], label=f'Layer {layer}')
-        plt.title('Average Assortativity (Superclass Groups) Across Epochs')
-        plt.xlabel('Epochs')
-        plt.ylabel('Assortativity (Superclass Groups)')
-        plt.legend(loc='upper left')
-        plt.savefig(f"{output_dir}/assortativity_super.png")
-
-        # Intuitive
-        assortativity_intuitive_values = np.array([[[metrics[epoch][layer][iteration]["assort_intuitive"]
-                                       for iteration in iterations] for layer in layers] for epoch in epochs])
-        avg_assortativity_intuitive = np.mean(assortativity_intuitive_values, axis=2)
-        plt.figure(figsize=(10, 6))
-        for i, layer in enumerate(layers):
-            plt.plot(epochs, avg_assortativity_intuitive[:, i], label=f'Layer {layer}')
-        plt.title('Average Assortativity (Intuitive Groups) Across Epochs')
-        plt.xlabel('Epochs')
-        plt.ylabel('Assortativity (Intuitive Groups)')
-        plt.legend(loc='upper left')
-        plt.savefig(f"{output_dir}/assortativity_intuitive.png")
+        _plot_metric_over_epochs(
+            "modularity_louvain", "Average Modularity (Louvain) Across Epochs",
+            "Modularity (Louvain)", f"{output_dir}/modularity_louvain.png",
+            metrics, epochs, layers, iterations,
+        )
+        if has_hierarchy:
+            _plot_metric_over_epochs(
+                "assort_nat_man", "Average Assortativity (Natural vs. Manmade) Across Epochs",
+                "Assortativity (Natural vs. Manmade)", f"{output_dir}/assortativity_nat_man.png",
+                metrics, epochs, layers, iterations,
+            )
+            _plot_metric_over_epochs(
+                "assort_super", "Average Assortativity (Superclass Groups) Across Epochs",
+                "Assortativity (Superclass Groups)", f"{output_dir}/assortativity_super.png",
+                metrics, epochs, layers, iterations,
+            )
+            _plot_metric_over_epochs(
+                "assort_intuitive", "Average Assortativity (Intuitive Groups) Across Epochs",
+                "Assortativity (Intuitive Groups)", f"{output_dir}/assortativity_intuitive.png",
+                metrics, epochs, layers, iterations,
+            )

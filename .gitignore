@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+graphic/
+train_vit/
+.venv/
+venv/
+env/
+
+# Data and model artifacts
+data/
+tiny-imagenet-200/
+tiny-imagenet-200.zip
+*.pth
+*.npy
+*.pt
+
+# Training outputs (TensorBoard, checkpoints, generated plots)
+resnet_checkpoints/
+resnet_conf_matrices/
+resnet_metrics/
+vit_conf_matrices/
+vit_conf_matrices_tiny/
+vit_metrics/
+vit_metrics_tiny/
+runs/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -17,10 +17,11 @@ pip install -r requirements.txt
 deactivate
 ```
 
-For training the model we call EffVit we create a second `venv` environment to avoid package conflicts according to:
-```bash
+For training the model we call EffVit we create a second `venv` environment to avoid package conflicts. EffVit follows the training methodology from:
+
+```
 @misc{irandoust2022training,
-      title={{Training a Vision Transformer from scratch in less than 24 hours with 1 GPU}}, 
+      title={{Training a Vision Transformer from scratch in less than 24 hours with 1 GPU}},
       author={Saghar Irandoust and Thibaut Durand and Yunduz Rakhmangulova and Wenjie Zi and Hossein Hajimirsadeghi},
       year={2022},
       eprint={2211.05187},
@@ -46,7 +47,7 @@ deactivate
 
 ## How to train the models
 
-To train ResNet-50, you can use the `train.py` script in the top Code_Graphic folder. For more information on the available options, run:
+To train ResNet-50, you can use the `train.py` script in the top-level folder. For more information on the available options, run:
 ```bash
 source graphic/bin/activate
 python train.py --help
@@ -67,7 +68,7 @@ If you run your training on a cluster managed with SLURM, you can use the provid
 The script also contains the hyperparameters used in the paper, if you want to reproduce the results.
 
 
-If you would like to train your model on Tiny ImageNet download the dataset by calling `python download_tiny_imagenet.py` from the top Code_Graphic folder.
+If you would like to train your model on Tiny ImageNet download the dataset by calling `python download_tiny_imagenet.py` from the top-level folder.
 
 If you run your training on a cluster managed with SLURM, you can use the provided `submit_tiny_training.sh` script to submit your training job. Your email address for SLURM notifications in the `submit_tiny_training.sh` script has to be adjusted.
 
@@ -75,11 +76,11 @@ The script also contains the hyperparameters used in the paper, if you want to r
 
 ## How to create the confusion matrices
 
-To create the confusion matrices for ResNet-50, you can use the `cifar-100-confusion-matrices.py` script. You will need to specify the path to the model weights, the model architecture, and which layers you want to extract, as well as an alpha value for balancing true and predicted labels. You can control for which checkpoints to run the script by specifying start and end indices corresponding to the natural sort order of the checkpoint files. For example:
+To create the confusion matrices for ResNet-50, use the `confusion_matrices_resnet.py` script. You specify the path to the model weights, the model architecture, and which layers to extract, plus an alpha value for balancing true and predicted labels. You can control which checkpoints to process via start/end indices and `--epoch_step`. For example:
 
 ```bash
 source graphic/bin/activate
-python cifar-100-confusion-matrices.py --checkpoint_dir $checkpoints_dir --output_dir $output_dir --model resnet50 --small_conv1 --only layer1 layer2 layer3 layer4 --start_index 1 --end_index 72 --epoch_step 5 --alpha 0.0 --iterations 1 --weight_decay
+python confusion_matrices_resnet.py --checkpoint_dir $checkpoints_dir --output_dir $output_dir --model resnet50 --small_conv1 --only layer1 layer2 layer3 layer4 --start_index 1 --end_index 72 --epoch_step 5 --alpha 0.0 --iterations 1 --weight_decay
 ```
 
 will create confusion matrices for `layer1` to `layer4` of ResNet-50, using every 5th checkpoint from the first to the 71st checkpoint, and training only on predicted labels (`alpha=0.0`). For the results from the paper we compute the confusion matrices layer-wise.
@@ -87,12 +88,18 @@ will create confusion matrices for `layer1` to `layer4` of ResNet-50, using ever
 For more information on the available options, run:
 ```bash
 source graphic/bin/activate
-python cifar-100-confusion-matrices.py --help
+python confusion_matrices_resnet.py --help
 ```
 
-This script can be adapted for other model architectures as well, but it would be necessary to adjust the model loading code accordingly. Extraction by layer name relies on the layer only outputting the relevant features, so model output may need to be modified to achieve this.
+This script can be adapted for other CNN-style architectures, but the model loading and layer extraction may need to be adjusted (the layer must output the relevant features cleanly).
 
-For this reason, creating confusion matrices for EffVit models is available in its own script `conf_matrices_vit.py`. You can run it in a similar way.
+For EffVit models, use the dedicated `confusion_matrices_vit.py` script. It pre-extracts and caches per-block class-token features, then trains a linear classifier on the cached features per block. Example call:
+
+```bash
+python confusion_matrices_vit.py --checkpoint_dir $checkpoints_dir --output_dir $output_dir --model efficient-vit --start_index 0 --end_index 10 --alpha 0.0 --num_classes 100 --depth 12 --weight_decay
+```
+
+Both scripts share their classifier-training and matrix-construction logic via `confusion_matrix_pipeline.py`. Each script writes two confusion matrices per checkpoint / layer-or-block: one on the held-out eval portion of the training set (`*_use_trainset.npy`) and one on the validation set (`*_use_valset.npy`).
 
 SLURM scripts for both ResNet-50 and EffVit confusion matrix generation are provided in the `cluster_submit_confusion_matrix_job.sh` and `cluster_submit_vit_conf_matrix_job.sh` files, respectively. To create confusion matrices on Tiny ImageNet run `cluster_submit_vit_tiny_conf_matrix_job.sh`. As for the training scripts, adjust the email address.
 
@@ -107,24 +114,22 @@ For more information about the script call:
 source graphic/bin/activate
 python metrics.py --help
 ```
-There are five options to consider. The parameter alpha has to be specified, the model chosen and three optional flags can be set: `--plot-metrics`, which will plot the metrics for each layer along the epochs, and save the plots in the output directory, `--train-set`, which leads to the computation for the trainset and `--plot-graphs`, which leads to the plotting of the confusion graphs.
+Required arguments: `--matrix-dir` and `--output-dir`. The `--dataset` flag selects which class metadata to use (`cifar100` or `tiny-imagenet`, default `cifar100`); Tiny ImageNet has no class hierarchy, so the script automatically skips the assortativity computations. Optional flags: `--alpha` (default 1.0), `--train-set` (compute on the held-out train split rather than the test/validation split), `--plot-metrics` (line plots per layer over epochs), `--plot-graphs` (confusion-graph SVGs). `--seed` (default 42) sets the seed of the Louvain community detection.
 
-Make sure to set the correct matrix and output directories. For ResNet-50 a possible call looks like the following:
+Make sure to set the correct matrix and output directories. For ResNet-50 on CIFAR-100:
 
 ```bash
-python metrics.py --matrix-dir resnet_conf_matrices --output-dir resnet_metrics --alpha 0.0 --train-set --plot-metrics --plot-graphs
-
+python metrics.py --matrix-dir resnet_conf_matrices --output-dir resnet_metrics --dataset cifar100 --alpha 0.0 --train-set --plot-metrics --plot-graphs
 ```
 
-For EffVit a possible call is:
+For EffVit on CIFAR-100:
 ```bash
-python metrics.py --matrix-dir vit_conf_matrices --output-dir vit_metrics --alpha 0.0 --train-set --plot-metrics --plot-graphs
+python metrics.py --matrix-dir vit_conf_matrices --output-dir vit_metrics --dataset cifar100 --alpha 0.0 --train-set --plot-metrics --plot-graphs
 ```
 
-
-For EffVit trained on Tiny ImageNet a possible call is:
+For EffVit trained on Tiny ImageNet:
 ```bash
-python metrics_tiny.py --matrix-dir vit_conf_matrices_tiny --output-dir vit_metrics_tiny --alpha 0.0 --train-set --plot-metrics --plot-graphs
+python metrics.py --matrix-dir vit_conf_matrices_tiny --output-dir vit_metrics_tiny --dataset tiny-imagenet --alpha 0.0 --train-set --plot-metrics --plot-graphs
 ```
 
 
@@ -140,5 +145,22 @@ author = {Mathieu Bastian and Sebastien Heymann and Mathieu Jacomy},
 title = {Gephi: An Open Source Software for Exploring and Manipulating Networks},
 conference = {International AAAI Conference on Weblogs and Social Media},
 year = {2009},
+}
+```
+
+## Citation
+
+If you use this code, please cite:
+
+```bibtex
+@article{
+fr{\"o}hlich2026the,
+title={The Confusion is Real: {GRAPHIC} - A Network Science Approach to Confusion Matrices in Deep Learning},
+author={Johanna S. Fr{\"o}hlich and Bastian Heinlein and Jan U. Claar and Hans Rosenberger and Vasileios Belagiannis and Ralf R. M{\"u}ller},
+journal={Transactions on Machine Learning Research},
+issn={2835-8856},
+year={2026},
+url={https://openreview.net/forum?id=UP9bx1WJwR},
+note={J2C Certification}
 }
 ```

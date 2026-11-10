@@ -1,3 +1,4 @@
+import os
 import random
 import re
 
@@ -226,8 +227,15 @@ def seed_worker(worker_id):
 def file_matrix(matrix_files):
     """Index confusion-matrix files by (epoch, iteration, layer, use_val).
 
-    The boolean axis distinguishes ``_use_trainset.npy`` (False) from
-    ``_use_valset.npy`` (True).
+    The boolean axis distinguishes ``_use_trainset.npy`` (False) from the
+    held-out partition (True). The held-out partition's filename suffix is
+    ``_use_valset.npy`` for the image-classification pipeline (resnet/vit;
+    a true validation set) and ``_use_testset.npy`` for the text-
+    classification pipeline (CNN/GCN under the no-early-stop methodology
+    where the held-out partition is a genuine test set).
+
+    Layers that exist only for the held-out partition (e.g. the output layer
+    of the text models) get an empty string for the training partition.
 
     :param matrix_files: a list of file paths to the confusion matrices.
     :return: (file_matrix, unique_epochs, unique_iterations, unique_layers)
@@ -238,19 +246,21 @@ def file_matrix(matrix_files):
 
     matrix_dict = {}
     for f in matrix_files:
-        epoch_match = re.search(r'epoch_([^_]+)', f)
+        # Only the file name counts, the folders may be named anything.
+        name = os.path.basename(f)
+        epoch_match = re.search(r'epoch_([^_]+)', name)
         if epoch_match is not None:
             epoch = epoch_match.group(1)
         else:
             epoch = 'random'
-        iteration = re.search(r'iteration_([^_-]+)', f).group(1)
-        layer = re.search(r'layer([^_]+)', f)
+        iteration = re.search(r'iteration_([^_-]+)', name).group(1)
+        layer = re.search(r'layer([^_]+)', name)
         if layer is None:
-            layer = re.search(r'block_([^_]+)', f)
+            layer = re.search(r'block_([^_]+)', name)
         if layer is None:
             raise ValueError(f'Could not find layer in file name {f}')
         layer = layer.group(1)
-        use_val = 'valset' in f
+        use_val = name.endswith(('_use_valset.npy', '_use_testset.npy'))
         unique_epochs.add(epoch)
         unique_iterations.add(iteration)
         unique_layers.add(layer)
@@ -266,6 +276,6 @@ def file_matrix(matrix_files):
         for j, iteration in enumerate(unique_iterations):
             for k, layer in enumerate(unique_layers):
                 for l, use_val in enumerate([False, True]):
-                    fm[i, j, k, l] = matrix_dict[(epoch, iteration, layer, use_val)]
+                    fm[i, j, k, l] = matrix_dict.get((epoch, iteration, layer, use_val), "")
 
     return fm, unique_epochs, unique_iterations, unique_layers

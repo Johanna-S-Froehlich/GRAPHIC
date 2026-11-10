@@ -10,17 +10,46 @@ import matplotlib.pyplot as plt
 
 from utils import file_matrix
 
+try:
+    import infomap
+except ImportError:  # only needed for the Infomap communities
+    infomap = None
 
-# Per-dataset configuration: which mappings module to import and the graph
-# plot canvas size that best fits that many class labels.
+
+# Per-dataset configuration: which mappings module to import, the graph plot
+# canvas size that best fits that many class labels, and the groupings the
+# assortativity is computed for. Each grouping is (metric suffix, key in the
+# module's ``mappings``, name used in prints and plots); the metric is stored
+# as ``assort_<suffix>`` and plotted to ``assortativity_<suffix>.png``.
+# ``heldout_only_layers`` are the output layers of KimCNN (fc) and Text GCN (2):
+# their matrices come from the predictions of the network on the test set, so
+# there are none for the training side.
 DATASET_CONFIG = {
     "cifar100": {
         "mappings_module": "cifar100_mappings",
         "graph_figsize": (16, 12),
+        "assortativity": [
+            ("nat_man", "make_superclass", "Natural vs. Manmade"),
+            ("super", "superclass_fine", "Superclass Groups"),
+            ("intuitive", "intuitive_fine", "Intuitive Groups"),
+        ],
     },
     "tiny-imagenet": {
         "mappings_module": "tinyimagenet_mappings",
         "graph_figsize": (32, 24),
+        "assortativity": [],
+    },
+    "r52": {
+        "mappings_module": "r52_mappings",
+        "graph_figsize": (16, 12),
+        "assortativity": [("human", "human", "Human Grouping")],
+        "heldout_only_layers": ["fc", "2"],
+    },
+    "wos46985": {
+        "mappings_module": "wos46985_mappings",
+        "graph_figsize": (32, 24),
+        "assortativity": [("human", "human", "Human Grouping")],
+        "heldout_only_layers": ["fc", "2"],
     },
 }
 
@@ -72,13 +101,16 @@ def calculate_association_matrix(C, fine_labels, fine_to_group_dict):
 
 def calculate_accuracy_score(C):
     """
-    Calculate the accuracy score from a normalized confusion matrix.
+    Calculate the accuracy score from a row-normalized confusion matrix.
+    
+    This is the mean per-class recall in percent, which equals the accuracy for
+    balanced classes such as CIFAR-100, but not for R52 and WOS-46985.
     
     Parameters:
     C (np.array): Normalized confusion matrix.
     
     Returns:
-    float: Accuracy score (between 0 and 1).
+    float: Accuracy score (between 0 and 100).
     """
     return np.trace(C)/ C.shape[0]*100
 
@@ -106,16 +138,93 @@ def compute_modularity_louvain(G: nx.DiGraph, seed: int = None) -> float:
 
     Args:
         G: nx.DiGraph: A directed graph.
-        seed (optional): random seed for Louvain; None gives a different partition on each run.
+        seed (optional): random seed for Louvain; None gives a random run.
 
     Returns:
         float: The computed modularity value, a measure of the quality of the graph's community structure.
 
     """
+    # Without any confusion every class is its own community and modularity is undefined.
+    if G.number_of_edges() == 0:
+        return float('nan'), [{node} for node in G.nodes()]
     # Modularity using Louvain modularity communities
     communities= nx.algorithms.community.louvain_communities(G, weight='weight', seed=seed)
     modularity_louv  = nx.algorithms.community.modularity(G, communities, weight='weight')
     return modularity_louv, communities
+
+def compute_communities_infomap(G: nx.DiGraph, seed: int = None) -> list:
+    """
+    Detects communities with Infomap on the directed weighted graph.
+
+    Classes without any confusion never enter the Infomap network, so each of
+    them is returned as a community of its own.
+
+    Args:
+        G: nx.DiGraph: A directed graph with integer nodes 0..n-1.
+        seed (optional): random seed for Infomap.
+
+    Returns:
+        list[set]: The detected communities.
+    """
+    if infomap is None:
+        raise ImportError("Infomap communities need the infomap package: pip install infomap")
+    if G.number_of_edges() == 0:
+        return [{node} for node in G.nodes()]
+
+    flags = "--directed --silent" if seed is None else f"--directed --silent --seed {seed}"
+    im = infomap.Infomap(flags)
+    for u, v, data in G.edges(data=True):
+        im.add_link(u, v, data['weight'])
+    im.run()
+
+    modules = {}
+    for node in im.tree:
+        if node.is_leaf:
+            modules.setdefault(node.module_id, set()).add(node.node_id)
+    communities = list(modules.values())
+    assigned = set().union(*communities)
+    communities += [{node} for node in G.nodes() if node not in assigned]
+    return communities
+
+def compute_communities_label_propagation(C_directed: np.ndarray, seed: int = None) -> list:
+    """
+    Detects communities with weighted asynchronous label propagation.
+
+    Label propagation has no directed formulation, so it runs on the symmetrized
+    graph 0.5 * (C + C^T), which keeps the confusions of both directions.
+
+    Args:
+        C_directed: Confusion matrix without its diagonal.
+        seed (optional): random seed for label propagation.
+
+    Returns:
+        list[set]: The detected communities.
+    """
+    G_sym = nx.from_numpy_array(0.5 * (C_directed + C_directed.T))
+    return list(nx.algorithms.community.asyn_lpa_communities(G_sym, weight='weight', seed=seed))
+
+def compute_ami(communities: list, fine_labels: list[str], human_grouping: list[set]) -> float:
+    """
+    Computes the adjusted mutual information between detected communities and a human grouping.
+
+    Args:
+        communities: detected communities as sets of class indices.
+        fine_labels: class names, in confusion-matrix order.
+        human_grouping: the human grouping as sets of class names.
+
+    Returns:
+        float: Adjusted mutual information (1 for identical groupings, about 0 for chance).
+    """
+    # Imported here so that the image pipeline does not load scikit-learn.
+    from sklearn.metrics import adjusted_mutual_info_score
+
+    human_id = {label: g for g, group in enumerate(human_grouping) for label in group}
+    detected_id = {node: c for c, community in enumerate(communities) for node in community}
+    # Compare only classes that are in the human grouping and in the graph.
+    compared = [i for i, label in enumerate(fine_labels) if label in human_id and i in detected_id]
+    human = [human_id[fine_labels[i]] for i in compared]
+    detected = [detected_id[i] for i in compared]
+    return adjusted_mutual_info_score(human, detected)
 
 def community_colors(n_communities: int) -> list:
     """
@@ -310,7 +419,7 @@ def _plot_metric_over_epochs(metric_key: str, title: str, ylabel: str, output_pa
     """Helper: plot one scalar metric averaged over iterations, one line per layer."""
     values = np.array([[[metrics_dict[epoch][layer][iteration][metric_key]
                          for iteration in iterations] for layer in layers] for epoch in epochs])
-    avg = np.mean(values, axis=2)
+    avg = np.nanmean(values, axis=2)
     plt.figure(figsize=(10, 6))
     for i, layer in enumerate(layers):
         plt.plot(epochs, avg[:, i], label=f'Layer {layer}')
@@ -332,14 +441,18 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', type=str, default='cifar100',
                         choices=sorted(DATASET_CONFIG.keys()),
                         help='Dataset whose class metadata to use. Tiny ImageNet '
-                             'has no class hierarchy, so assortativity is skipped.')
+                             'has no class hierarchy, so assortativity is skipped. '
+                             'R52 and WOS-46985 also get the AMI with the human grouping.')
     parser.add_argument('--alpha', type=float, default=1.0,
                         help='The parameter determining the cross entropy mix between true and predicted labels.')
     parser.add_argument('--train-set', action='store_true', help='Use training set confusion matrices.')
     parser.add_argument('--plot-metrics', action='store_true', help='Plot metrics after computation.')
     parser.add_argument('--plot-graphs', action='store_true', help='Plot graphs according to modularity communities.')
+    parser.add_argument('--all-communities', action='store_true',
+                        help='Also detect communities with Infomap and label propagation '
+                             '(default: Louvain only).')
     parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed for the Louvain community detection.')
+                        help='Random seed for Louvain, Infomap and label propagation.')
     args = parser.parse_args()
 
     config = DATASET_CONFIG[args.dataset]
@@ -347,7 +460,11 @@ if __name__ == "__main__":
     fine_labels = mappings_mod.fine_labels
     # Only datasets with a hierarchy expose ``mappings`` (one dict per grouping).
     dataset_mappings = getattr(mappings_mod, "mappings", None)
-    has_hierarchy = dataset_mappings is not None
+    assortativity_groupings = config["assortativity"] if dataset_mappings is not None else []
+    # Datasets with a human baseline grouping expose ``human_grouping``.
+    human_grouping = getattr(mappings_mod, "human_grouping", None)
+    algorithms = ["louvain", "infomap", "labelprop"] if args.all_communities else ["louvain"]
+    algorithm_names = {"louvain": "Louvain", "infomap": "Infomap", "labelprop": "Label Propagation"}
     num_classes = len(fine_labels)
 
     output_dir = os.path.join(args.output_dir, f"alpha_{args.alpha}")
@@ -364,6 +481,20 @@ if __name__ == "__main__":
     print(f"Found {len(epochs)} epochs, {len(iterations)} iterations, and {len(layers)} layers.")
 
     split_index = 0 if args.train_set else 1
+    # The output layers of the text models are skipped for the training side.
+    # Any other gap means the directory is incomplete.
+    available = fm[:, :, :, split_index] != ""
+    skipped = config.get("heldout_only_layers", []) if args.train_set else []
+    layer_indices = [j for j, layer in enumerate(layers)
+                     if layer not in skipped or available[:, :, j].any()]
+    if not layer_indices:
+        raise FileNotFoundError(f"No confusion matrices for this partition in {matrix_dir}")
+    missing = [f"epoch {epochs[i]}, iteration {iterations[k]}, layer {layers[j]}"
+               for i, k, j in zip(*np.nonzero(~available)) if j in layer_indices]
+    if missing:
+        raise FileNotFoundError(f"Missing confusion matrices in {matrix_dir}: " + "; ".join(missing))
+    fm = fm[:, :, layer_indices, :]
+    layers = [layers[j] for j in layer_indices]
 
     if args.plot_graphs:
         graph_dir = os.path.join(args.output_dir, f"alpha_{args.alpha}", "graphs")
@@ -388,21 +519,25 @@ if __name__ == "__main__":
                 G_directed = nx.from_numpy_array(C_directed, create_using=nx.DiGraph())
 
                 modularity_louvain, communities_louvain = compute_modularity_louvain(G_directed, seed=args.seed)
+                communities = {"louvain": communities_louvain}
+                if args.all_communities:
+                    communities["infomap"] = compute_communities_infomap(G_directed, seed=args.seed)
+                    communities["labelprop"] = compute_communities_label_propagation(C_directed, seed=args.seed)
                 accuracy = calculate_accuracy_score(C)
 
-                entry = {
-                    "modularity_louvain": float(modularity_louvain),
-                    "nr_communities_louvain": int(len(communities_louvain)),
-                    "accuracy": float(accuracy),
-                }
+                entry = {"modularity_louvain": float(modularity_louvain)}
+                for algorithm in algorithms:
+                    entry[f"nr_communities_{algorithm}"] = int(len(communities[algorithm]))
+                entry["accuracy"] = float(accuracy)
 
-                if has_hierarchy:
-                    entry["assort_nat_man"] = float(compute_weighted_assortativity(
-                        C_directed, fine_labels, dataset_mappings["make_superclass"]))
-                    entry["assort_super"] = float(compute_weighted_assortativity(
-                        C_directed, fine_labels, dataset_mappings["superclass_fine"]))
-                    entry["assort_intuitive"] = float(compute_weighted_assortativity(
-                        C_directed, fine_labels, dataset_mappings["intuitive_fine"]))
+                if human_grouping is not None:
+                    for algorithm in algorithms:
+                        entry[f"ami_{algorithm}_human"] = float(
+                            compute_ami(communities[algorithm], fine_labels, human_grouping))
+
+                for suffix, grouping_key, _ in assortativity_groupings:
+                    entry[f"assort_{suffix}"] = float(compute_weighted_assortativity(
+                        C_directed, fine_labels, dataset_mappings[grouping_key]))
 
                 metrics[epoch][layer][iteration] = entry
 
@@ -417,12 +552,20 @@ if __name__ == "__main__":
                 print("=== Graph Analysis Metrics ===")
                 print(f"Epoch: {epoch}, Layer: {layer}, Iteration: {iteration}")
                 print(f"Modularity (Louvain): {modularity_louvain:.4f}")
-                print(f"Number of Louvain Communities: {len(communities_louvain)}\n")
-                if has_hierarchy:
+                for algorithm in algorithms:
+                    print(f"Number of {algorithm_names[algorithm]} Communities: "
+                          f"{entry[f'nr_communities_{algorithm}']}")
+                print()
+                if human_grouping is not None:
+                    print("AMI with the human grouping:")
+                    for algorithm in algorithms:
+                        print(f"  {algorithm_names[algorithm]}: {entry[f'ami_{algorithm}_human']:.4f}")
+                    print()
+                if assortativity_groupings:
                     print("Assortativity Coefficients:")
-                    print(f"  Natural vs. Manmade: {entry['assort_nat_man']:.4f}")
-                    print(f"  Superclass Groups: {entry['assort_super']:.4f}")
-                    print(f"  Intuitive Groups: {entry['assort_intuitive']:.4f}\n")
+                    for suffix, _, name in assortativity_groupings:
+                        print(f"  {name}: {entry[f'assort_{suffix}']:.4f}")
+                    print()
                 print(f"Accuracy: {accuracy:.4f}")
 
 
@@ -437,19 +580,29 @@ if __name__ == "__main__":
             "Modularity (Louvain)", f"{output_dir}/modularity_louvain.png",
             metrics, epochs, layers, iterations,
         )
-        if has_hierarchy:
+        for algorithm in algorithms:
+            name = algorithm_names[algorithm]
+            if args.all_communities or human_grouping is not None:
+                _plot_metric_over_epochs(
+                    f"nr_communities_{algorithm}",
+                    f"Average Number of Communities ({name}) Across Epochs",
+                    f"Number of Communities ({name})",
+                    f"{output_dir}/nr_communities_{algorithm}.png",
+                    metrics, epochs, layers, iterations,
+                )
+            if human_grouping is not None:
+                _plot_metric_over_epochs(
+                    f"ami_{algorithm}_human",
+                    f"Average AMI with the Human Grouping ({name}) Across Epochs",
+                    f"AMI ({name} vs. human)",
+                    f"{output_dir}/ami_{algorithm}_human.png",
+                    metrics, epochs, layers, iterations,
+                )
+        for suffix, _, name in assortativity_groupings:
             _plot_metric_over_epochs(
-                "assort_nat_man", "Average Assortativity (Natural vs. Manmade) Across Epochs",
-                "Assortativity (Natural vs. Manmade)", f"{output_dir}/assortativity_nat_man.png",
-                metrics, epochs, layers, iterations,
-            )
-            _plot_metric_over_epochs(
-                "assort_super", "Average Assortativity (Superclass Groups) Across Epochs",
-                "Assortativity (Superclass Groups)", f"{output_dir}/assortativity_super.png",
-                metrics, epochs, layers, iterations,
-            )
-            _plot_metric_over_epochs(
-                "assort_intuitive", "Average Assortativity (Intuitive Groups) Across Epochs",
-                "Assortativity (Intuitive Groups)", f"{output_dir}/assortativity_intuitive.png",
+                f"assort_{suffix}",
+                f"Average Assortativity ({name}) Across Epochs",
+                f"Assortativity ({name})",
+                f"{output_dir}/assortativity_{suffix}.png",
                 metrics, epochs, layers, iterations,
             )

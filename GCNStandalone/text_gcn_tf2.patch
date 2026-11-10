@@ -1,0 +1,667 @@
+diff --git a/build_graph.py b/build_graph.py
+index e2b75f6..cf2dd36 100644
+--- a/build_graph.py
++++ b/build_graph.py
+@@ -15,7 +15,14 @@ from scipy.spatial.distance import cosine
+ if len(sys.argv) != 2:
+ 	sys.exit("Use: python build_graph.py <dataset>")
+ 
+-datasets = ['20ng', 'R8', 'R52', 'ohsumed', 'mr']
++# Pinned seeds. random.shuffle on train_ids/test_ids below + np.random.uniform
++# for the OOV word-embedding init at line ~317 would otherwise re-randomise on
++# every job submission, defeating the seed pin in train.py. seed=42 matches
++# the CNN side's set_seed() convention and prepare_for_gcn.py's random_state.
++random.seed(42)
++np.random.seed(42)
++
++datasets = ['20ng', 'R8', 'R52', 'ohsumed', 'mr', 'WOS11967', 'WOS46985']
+ # build corpus
+ dataset = sys.argv[1]
+ 
+@@ -208,11 +215,16 @@ Word definitions end
+ '''
+ 
+ # label list
++# Sorted explicitly so the GCN's output class order (and therefore the
++# layer-2 score column ordering used to build the head CM) matches the
++# class order of the confusion matrices (sorted(set(labels))).
++# set() iteration order is insertion-dependent and would silently
++# permute the head CM.
+ label_set = set()
+ for doc_meta in shuffle_doc_name_list:
+     temp = doc_meta.split('\t')
+     label_set.add(temp[2])
+-label_list = list(label_set)
++label_list = sorted(label_set)
+ 
+ label_list_str = '\n'.join(label_list)
+ f = open('data/corpus/' + dataset + '_labels.txt', 'w')
+@@ -220,10 +232,12 @@ f.write(label_list_str)
+ f.close()
+ 
+ # x: feature vectors of training docs, no initial features
+-# slect 90% training set
++# No GCN-internal validation slice: we train for a fixed number of epochs
++# under cosine LR (mirrors the CNN side, eliminates val leakage, and keeps
++# the GCN and CNN train/test splits identical at the doc level).
+ train_size = len(train_ids)
+-val_size = int(0.1 * train_size)
+-real_train_size = train_size - val_size  # - int(0.5 * train_size)
++val_size = 0
++real_train_size = train_size
+ # different training rates
+ 
+ real_train_doc_names = shuffle_doc_name_list[:real_train_size]
+diff --git a/inits.py b/inits.py
+index 4a2f1ae..104a3fe 100644
+--- a/inits.py
++++ b/inits.py
+@@ -4,14 +4,14 @@ import numpy as np
+ 
+ def uniform(shape, scale=0.05, name=None):
+     """Uniform init."""
+-    initial = tf.random_uniform(shape, minval=-scale, maxval=scale, dtype=tf.float32)
++    initial = tf.random.uniform(shape, minval=-scale, maxval=scale, dtype=tf.float32)
+     return tf.Variable(initial, name=name)
+ 
+ 
+ def glorot(shape, name=None):
+     """Glorot & Bengio (AISTATS 2010) init."""
+     init_range = np.sqrt(6.0/(shape[0]+shape[1]))
+-    initial = tf.random_uniform(shape, minval=-init_range, maxval=init_range, dtype=tf.float32)
++    initial = tf.random.uniform(shape, minval=-init_range, maxval=init_range, dtype=tf.float32)
+     return tf.Variable(initial, name=name)
+ 
+ 
+diff --git a/layers.py b/layers.py
+index d3b8504..ae42175 100644
+--- a/layers.py
++++ b/layers.py
+@@ -1,7 +1,7 @@
+ from inits import *
+ import tensorflow as tf
+ 
+-flags = tf.app.flags
++flags = tf.compat.v1.app.flags
+ FLAGS = flags.FLAGS
+ 
+ # global unique layer ID dictionary for layer name assignment
+@@ -21,21 +21,38 @@ def get_layer_uid(layer_name=''):
+ def sparse_dropout(x, keep_prob, noise_shape):
+     """Dropout for sparse tensors."""
+     random_tensor = keep_prob
+-    random_tensor += tf.random_uniform(noise_shape)
++    random_tensor += tf.random.uniform(noise_shape)
+     dropout_mask = tf.cast(tf.floor(random_tensor), dtype=tf.bool)
+-    pre_out = tf.sparse_retain(x, dropout_mask)
++    pre_out = tf.sparse.retain(x, dropout_mask)
+     return pre_out * (1./keep_prob)
+ 
+ 
+ def dot(x, y, sparse=False):
+     """Wrapper for tf.matmul (sparse vs dense)."""
+     if sparse:
+-        res = tf.sparse_tensor_dense_matmul(x, y)
++        res = tf.sparse.sparse_dense_matmul(x, y)
+     else:
+         res = tf.matmul(x, y)
+     return res
+ 
+ 
++def safe_sparse_dense_matmul(a_sparse, b_dense, split=1):
++    # TF's GPU SparseTensorDenseMatMul kernel refuses when
++    # b.shape[1] * nnz(a) > 2^31 (int32 indexing). For WoS46985 the
++    # adjacency has nnz ~ 4.2e7 and both GCN layers' dense operands have
++    # ~140 cols, so the product overflows. Splitting the dense matrix
++    # along its column axis and concatenating the partial products keeps
++    # each call under the limit.
++    if split <= 1:
++        return tf.sparse.sparse_dense_matmul(a_sparse, b_dense)
++    cols = int(b_dense.shape[1])
++    base, rem = divmod(cols, split)
++    sizes = [base + (1 if i < rem else 0) for i in range(split)]
++    chunks = tf.split(b_dense, num_or_size_splits=sizes, axis=1)
++    pieces = [tf.sparse.sparse_dense_matmul(a_sparse, c) for c in chunks]
++    return tf.concat(pieces, axis=1)
++
++
+ class Layer(object):
+     """Base layer class. Defines basic API for all layer objects.
+     Implementation inspired by keras (http://keras.io).
+@@ -69,7 +86,7 @@ class Layer(object):
+         return inputs
+ 
+     def __call__(self, inputs):
+-        with tf.name_scope(self.name):
++        with tf.compat.v1.name_scope(self.name):
+             if self.logging and not self.sparse_inputs:
+                 tf.summary.histogram(self.name + '/inputs', inputs)
+             outputs = self._call(inputs)
+@@ -101,7 +118,7 @@ class Dense(Layer):
+         # helper variable for sparse dropout
+         self.num_features_nonzero = placeholders['num_features_nonzero']
+ 
+-        with tf.variable_scope(self.name + '_vars'):
++        with tf.compat.v1.variable_scope(self.name + '_vars'):
+             self.vars['weights'] = glorot([input_dim, output_dim],
+                                           name='weights')
+             if self.bias:
+@@ -117,7 +134,7 @@ class Dense(Layer):
+         if self.sparse_inputs:
+             x = sparse_dropout(x, 1-self.dropout, self.num_features_nonzero)
+         else:
+-            x = tf.nn.dropout(x, 1-self.dropout)
++            x = tf.nn.dropout(x, rate=1 - (1-self.dropout))
+ 
+         # transform
+         output = dot(x, self.vars['weights'], sparse=self.sparse_inputs)
+@@ -150,7 +167,7 @@ class GraphConvolution(Layer):
+         # helper variable for sparse dropout
+         self.num_features_nonzero = placeholders['num_features_nonzero']
+ 
+-        with tf.variable_scope(self.name + '_vars'):
++        with tf.compat.v1.variable_scope(self.name + '_vars'):
+             for i in range(len(self.support)):
+                 self.vars['weights_' + str(i)] = glorot([input_dim, output_dim],
+                                                         name='weights_' + str(i))
+@@ -167,7 +184,7 @@ class GraphConvolution(Layer):
+         if self.sparse_inputs:
+             x = sparse_dropout(x, 1-self.dropout, self.num_features_nonzero)
+         else:
+-            x = tf.nn.dropout(x, 1-self.dropout)
++            x = tf.nn.dropout(x, rate=1 - (1-self.dropout))
+ 
+         # convolve
+         supports = list()
+@@ -177,12 +194,21 @@ class GraphConvolution(Layer):
+                               sparse=self.sparse_inputs)
+             else:
+                 pre_sup = self.vars['weights_' + str(i)]
+-            support = dot(self.support[i], pre_sup, sparse=True)
++            support = safe_sparse_dense_matmul(
++                self.support[i], pre_sup,
++                split=getattr(FLAGS, 'sparse_matmul_split', 1))
+             supports.append(support)
+         output = tf.add_n(supports)
+ 
+         # bias
+         if self.bias:
+             output += self.vars['bias']
+-        self.embedding = output #output
+-        return self.act(output)
++        # Probe the POST-activation output: the KimCNN conv probes hook the
++        # branch outputs after ReLU, and the original GRAPHIC ResNet probes
++        # are post-activation module outputs, so the LC must see the same
++        # kind of representation here (pre-ReLU would be a quantity the
++        # network never propagates). Layer 2 uses an identity activation,
++        # so the head CM's argmax is unaffected either way.
++        activated = self.act(output)
++        self.embedding = activated
++        return activated
+diff --git a/metrics.py b/metrics.py
+index 18ab3a9..3c5d363 100644
+--- a/metrics.py
++++ b/metrics.py
+@@ -3,7 +3,7 @@ import tensorflow as tf
+ def masked_softmax_cross_entropy(preds, labels, mask):
+     """Softmax cross-entropy loss with masking."""
+     print(preds)
+-    loss = tf.nn.softmax_cross_entropy_with_logits(logits=preds, labels=labels)
++    loss = tf.nn.softmax_cross_entropy_with_logits(logits=preds, labels=tf.stop_gradient(labels))
+     mask = tf.cast(mask, dtype=tf.float32)
+     mask /= tf.reduce_mean(mask)
+     loss *= mask
+diff --git a/models.py b/models.py
+index fdd52d5..b46f9e2 100644
+--- a/models.py
++++ b/models.py
+@@ -2,7 +2,7 @@ from layers import *
+ from metrics import *
+ import tensorflow as tf
+ 
+-flags = tf.app.flags
++flags = tf.compat.v1.app.flags
+ FLAGS = flags.FLAGS
+ 
+ 
+@@ -38,7 +38,7 @@ class Model(object):
+ 
+     def build(self):
+         """ Wrapper for _build() """
+-        with tf.variable_scope(self.name):
++        with tf.compat.v1.variable_scope(self.name):
+             self._build()
+ 
+         # Build sequential layer model
+@@ -49,7 +49,7 @@ class Model(object):
+         self.outputs = self.activations[-1]
+ 
+         # Store model variables for easy access
+-        variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=self.name)
++        variables = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.GLOBAL_VARIABLES, scope=self.name)
+         self.vars = {var.name: var for var in variables}
+ 
+         # Build metrics
+@@ -70,14 +70,14 @@ class Model(object):
+     def save(self, sess=None):
+         if not sess:
+             raise AttributeError("TensorFlow session not provided.")
+-        saver = tf.train.Saver(self.vars)
++        saver = tf.compat.v1.train.Saver(self.vars)
+         save_path = saver.save(sess, "tmp/%s.ckpt" % self.name)
+         print("Model saved in file: %s" % save_path)
+ 
+     def load(self, sess=None):
+         if not sess:
+             raise AttributeError("TensorFlow session not provided.")
+-        saver = tf.train.Saver(self.vars)
++        saver = tf.compat.v1.train.Saver(self.vars)
+         save_path = "tmp/%s.ckpt" % self.name
+         saver.restore(sess, save_path)
+         print("Model restored from file: %s" % save_path)
+@@ -93,7 +93,9 @@ class MLP(Model):
+         self.output_dim = placeholders['labels'].get_shape().as_list()[1]
+         self.placeholders = placeholders
+ 
+-        self.optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.learning_rate)
++        # LR is fed via a placeholder so a cosine schedule can drive it.
++        self.optimizer = tf.compat.v1.train.AdamOptimizer(
++            learning_rate=placeholders['learning_rate'])
+ 
+         self.build()
+ 
+@@ -140,7 +142,9 @@ class GCN(Model):
+         self.output_dim = placeholders['labels'].get_shape().as_list()[1]
+         self.placeholders = placeholders
+ 
+-        self.optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.learning_rate)
++        # LR is fed via a placeholder so a cosine schedule can drive it.
++        self.optimizer = tf.compat.v1.train.AdamOptimizer(
++            learning_rate=placeholders['learning_rate'])
+ 
+         self.build()
+ 
+@@ -160,7 +164,9 @@ class GCN(Model):
+         self.labels = tf.argmax(self.placeholders['labels'], 1)
+ 
+     def _build(self):
+-
++        # Input layer: sparse identity-features -> hidden1, ReLU.
++        # featureless=True + sparse_inputs=True is the Yao default (graph
++        # nodes are doc+word identities, no real features to project).
+         self.layers.append(GraphConvolution(input_dim=self.input_dim,
+                                             output_dim=FLAGS.hidden1,
+                                             placeholders=self.placeholders,
+@@ -170,10 +176,24 @@ class GCN(Model):
+                                             sparse_inputs=True,
+                                             logging=self.logging))
+ 
++        # Optional middle GraphConvolution layers for num_layers >= 3. Each
++        # is hidden1 -> hidden1 with ReLU, on dense activations. Yao tested
++        # this in Section 5.2 and found 2 layers optimal on their datasets;
++        # we expose it as a flag to replicate the ablation on WoS46985.
++        for _ in range(max(0, FLAGS.num_layers - 2)):
++            self.layers.append(GraphConvolution(input_dim=FLAGS.hidden1,
++                                                output_dim=FLAGS.hidden1,
++                                                placeholders=self.placeholders,
++                                                act=tf.nn.relu,
++                                                dropout=True,
++                                                logging=self.logging))
++
++        # Classifier head: hidden1 -> num_classes, identity activation
++        # (softmax is applied inside masked_softmax_cross_entropy).
+         self.layers.append(GraphConvolution(input_dim=FLAGS.hidden1,
+                                             output_dim=self.output_dim,
+                                             placeholders=self.placeholders,
+-                                            act=lambda x: x, #
++                                            act=lambda x: x,
+                                             dropout=True,
+                                             logging=self.logging))
+ 
+diff --git a/remove_words.py b/remove_words.py
+index d7a7e37..666bb3e 100644
+--- a/remove_words.py
++++ b/remove_words.py
+@@ -8,7 +8,7 @@ import sys
+ if len(sys.argv) != 2:
+ 	sys.exit("Use: python remove_words.py <dataset>")
+ 
+-datasets = ['20ng', 'R8', 'R52', 'ohsumed', 'mr']
++datasets = ['20ng', 'R8', 'R52', 'ohsumed', 'mr', 'WOS11967', 'WOS46985']
+ dataset = sys.argv[1]
+ 
+ if dataset not in datasets:
+diff --git a/train.py b/train.py
+index 3c05191..6972fba 100644
+--- a/train.py
++++ b/train.py
+@@ -3,6 +3,11 @@ from __future__ import print_function
+ 
+ import time
+ import tensorflow as tf
++gpus = tf.config.list_physical_devices('GPU')
++print("Num GPUs Available: ", len(gpus))
++print(gpus)
++
++tf.compat.v1.disable_eager_execution()
+ 
+ from sklearn import metrics
+ from utils import *
+@@ -11,39 +16,64 @@ import random
+ import os
+ import sys
+ 
+-if len(sys.argv) != 2:
+-	sys.exit("Use: python train.py <dataset>")
++# Yao's original layout took only `dataset` as positional argv; we now also
++# pass --activations_dir via absl flags, so additional argv entries are fine.
++# Just check there's at least a dataset slot.
++if len(sys.argv) < 2:
++	sys.exit("Use: python train.py <dataset> [--activations_dir DIR]")
+ 
+-datasets = ['20ng', 'R8', 'R52', 'ohsumed', 'mr']
++datasets = ['20ng', 'R8', 'R52', 'ohsumed', 'mr', 'WOS11967', 'WOS46985']
+ dataset = sys.argv[1]
+ 
+ if dataset not in datasets:
+ 	sys.exit("wrong dataset name")
+ 
+ 
+-# Set random seed
+-seed = random.randint(1, 200)
++# Pinned seed (Yao's code draws a random seed per run). Repeated runs give the
++# same GCN only if the graph is the same too, see PYTHONHASHSEED in
++# cluster_run_gcn.sh.
++seed = 42
++random.seed(seed)
+ np.random.seed(seed)
+-tf.set_random_seed(seed)
++tf.compat.v1.set_random_seed(seed)
+ 
+ # Settings
+-os.environ["CUDA_VISIBLE_DEVICES"] = ""
++# commented out to use GPU for training
++# os.environ["CUDA_VISIBLE_DEVICES"] = ""
+ 
+-flags = tf.app.flags
++flags = tf.compat.v1.app.flags
+ FLAGS = flags.FLAGS
+ # 'cora', 'citeseer', 'pubmed'
+ flags.DEFINE_string('dataset', dataset, 'Dataset string.')
+ # 'gcn', 'gcn_cheby', 'dense'
+ flags.DEFINE_string('model', 'gcn', 'Model string.')
+-flags.DEFINE_float('learning_rate', 0.02, 'Initial learning rate.')
+-flags.DEFINE_integer('epochs', 200, 'Number of epochs to train.')
+-flags.DEFINE_integer('hidden1', 200, 'Number of units in hidden layer 1.')
++flags.DEFINE_float('learning_rate', 0.02, 'Initial (peak) learning rate.')
++flags.DEFINE_integer('epochs', 150, 'Number of epochs to train.')
++flags.DEFINE_integer('hidden1', 200, 'Number of units in hidden layer 1. '
++                     'Per-dataset values are set in cluster_run_gcn.sh '
++                     'via the --hidden1 CLI override.')
++flags.DEFINE_integer('num_layers', 2,
++                     'Number of GraphConvolution layers. Yao Text-GCN uses '
++                     '2 (their depth ablation Section 5.2 finds 2 optimal '
++                     'on R8/R52/20NG/Ohsumed/MR). >=3 inserts '
++                     '(num_layers - 2) hidden1->hidden1 ReLU middle layers '
++                     'between the input projection and the classifier head.')
+ flags.DEFINE_float('dropout', 0.5, 'Dropout rate (1 - keep probability).')
+ flags.DEFINE_float('weight_decay', 0,
+                    'Weight for L2 loss on embedding matrix.')  # 5e-4
+-flags.DEFINE_integer('early_stopping', 10,
+-                     'Tolerance for early stopping (# of epochs).')
+ flags.DEFINE_integer('max_degree', 3, 'Maximum Chebyshev polynomial degree.')
++flags.DEFINE_integer('sparse_matmul_split', 1,
++                     'Column-split factor for GraphConvolution sparse-dense '
++                     'matmul. Set >1 to keep b.shape[1] * nnz(a) under 2^31 '
++                     'on the GPU kernel (WoS46985 needs 4).')
++flags.DEFINE_string('activations_dir', 'activations',
++                    'Where to dump per-epoch train/test activation files.')
++
++import math
++def cosine_lr(epoch, total_epochs, base_lr):
++    """CosineAnnealingLR matching torch.optim.lr_scheduler.CosineAnnealingLR
++    with T_max=total_epochs, eta_min=0."""
++    return 0.5 * base_lr * (1.0 + math.cos(math.pi * epoch / total_epochs))
+ 
+ # Load data
+ adj, features, y_train, y_val, y_test, train_mask, val_mask, test_mask, train_size, test_size = load_corpus(
+@@ -72,25 +102,59 @@ elif FLAGS.model == 'dense':
+ else:
+     raise ValueError('Invalid argument for model: ' + str(FLAGS.model))
+ 
++# Auto-size --sparse_matmul_split from the real adjacency nnz and the
++# largest dense-operand column count we'll see (max of hidden1 and
++# num_classes). The GPU SparseTensorDenseMatMul kernel rejects
++# cols * nnz >= 2^31; we keep ~15% margin. The user-provided value via
++# --sparse_matmul_split is treated as a floor, never reduced.
++_support_nnz = max(len(s[1]) for s in support)
++_int32_limit = 2 ** 31
++_max_cols_per_chunk = max(1, int(0.85 * _int32_limit / _support_nnz))
++_max_cols_needed = max(FLAGS.hidden1, y_train.shape[1])
++_needed_split = max(1, -(-_max_cols_needed // _max_cols_per_chunk))  # ceil div
++if FLAGS.sparse_matmul_split < _needed_split:
++    print(f"[auto] sparse_matmul_split: {FLAGS.sparse_matmul_split} -> "
++          f"{_needed_split} (support_nnz={_support_nnz}, "
++          f"max_cols={_max_cols_needed}, chunk_cap={_max_cols_per_chunk})")
++    FLAGS.sparse_matmul_split = _needed_split
++
++# Run-identification dump. Single machine-readable line so any log can be
++# unambiguously associated with its config without filename guessing.
++print(
++    "CONFIG: "
++    f"dataset={FLAGS.dataset}, hidden1={FLAGS.hidden1}, "
++    f"learning_rate={FLAGS.learning_rate}, weight_decay={FLAGS.weight_decay}, "
++    f"epochs={FLAGS.epochs}, num_layers={FLAGS.num_layers}, "
++    f"dropout={FLAGS.dropout}, sparse_matmul_split={FLAGS.sparse_matmul_split}, "
++    f"seed={seed}",
++    flush=True)
++
+ # Define placeholders
+ placeholders = {
+-    'support': [tf.sparse_placeholder(tf.float32) for _ in range(num_supports)],
+-    'features': tf.sparse_placeholder(tf.float32, shape=tf.constant(features[2], dtype=tf.int64)),
+-    'labels': tf.placeholder(tf.float32, shape=(None, y_train.shape[1])),
+-    'labels_mask': tf.placeholder(tf.int32),
+-    'dropout': tf.placeholder_with_default(0., shape=()),
++    'support': [tf.compat.v1.sparse_placeholder(tf.float32) for _ in range(num_supports)],
++    'features': tf.compat.v1.sparse_placeholder(tf.float32, shape=tf.constant(features[2], dtype=tf.int64)),
++    'labels': tf.compat.v1.placeholder(tf.float32, shape=(None, y_train.shape[1])),
++    'labels_mask': tf.compat.v1.placeholder(tf.int32),
++    'dropout': tf.compat.v1.placeholder_with_default(0., shape=()),
++    'learning_rate': tf.compat.v1.placeholder_with_default(
++        FLAGS.learning_rate, shape=()),
+     # helper variable for sparse dropout
+-    'num_features_nonzero': tf.placeholder(tf.int32)
++    'num_features_nonzero': tf.compat.v1.placeholder(tf.int32)
+ }
+ 
+ # Create model
+ print(features[2][1])
+ model = model_func(placeholders, input_dim=features[2][1], logging=True)
+ 
+-# Initialize session
+-session_conf = tf.ConfigProto(gpu_options=tf.GPUOptions(allow_growth=True))
+-sess = tf.Session(config=session_conf)
+-
++# Initialize session. allow_soft_placement lets TF fall back to CPU for ops
++# whose GPU kernel rejects the input -- specifically SparseTensorDenseMatMul,
++# whose CUDA kernel requires output.shape[1] * nnz(a) < 2^31. WoS46985's
++# adjacency overflows that on GPU; with soft placement the op runs on CPU
++# instead of throwing.
++session_conf = tf.compat.v1.ConfigProto(
++    allow_soft_placement=True,
++    gpu_options=tf.compat.v1.GPUOptions(allow_growth=True))
++sess = tf.compat.v1.Session(config=session_conf)
+ 
+ # Define model evaluation function
+ def evaluate(features, support, labels, mask, placeholders):
+@@ -100,40 +164,98 @@ def evaluate(features, support, labels, mask, placeholders):
+     outs_val = sess.run([model.loss, model.accuracy, model.pred, model.labels], feed_dict=feed_dict_val)
+     return outs_val[0], outs_val[1], outs_val[2], outs_val[3], (time.time() - t_test)
+ 
++def extract_activations(features, support, labels, placeholders, train_mask, test_mask, out_dir=''):
++    feed_dict_val = construct_feed_dict(
++        features, support, labels, test_mask, placeholders)
++    # extract activations for both layers on forward pass
++    activations = sess.run([model.layers[0].embedding, model.layers[1].embedding], feed_dict=feed_dict_val)
++
++    os.makedirs(out_dir, exist_ok=True)
++    # train set activations
++    idxs = np.where(train_mask)[0] if hasattr(train_mask, '__iter__') else range(activations[0].shape[0])
++    with open(f'{out_dir}/epoch_{epoch}_train_activations_1.txt', 'w') as f:
++        for i in idxs:
++            act1 = activations[0][i]
++            f.write(' '.join(map(str, act1)) + '\n')
++    with open(f'{out_dir}/epoch_{epoch}_train_activations_2.txt', 'w') as f:
++        for i in idxs:
++            act2 = activations[1][i]
++            f.write(' '.join(map(str, act2)) + '\n')
++    # test set activations
++    idxs = np.where(test_mask)[0] if hasattr(test_mask, '__iter__') else range(activations[0].shape[0])
++    with open(f'{out_dir}/epoch_{epoch}_test_activations_1.txt', 'w') as f:
++        for i in idxs:
++            act1 = activations[0][i]
++            f.write(' '.join(map(str, act1)) + '\n')
++    with open(f'{out_dir}/epoch_{epoch}_test_activations_2.txt', 'w') as f:
++        for i in idxs:
++            act2 = activations[1][i]
++            f.write(' '.join(map(str, act2)) + '\n')
+ 
+ # Init variables
+-sess.run(tf.global_variables_initializer())
+-
+-cost_val = []
++sess.run(tf.compat.v1.global_variables_initializer())
+ 
+-# Train model
++# Train model — fixed N epochs under cosine LR; no validation set, no early
++# stopping (mirrors the CNN side, eliminates val leakage). The "val_*" labels
++# from earlier Yao-style logs are intentionally absent here.
++train_acc_log = []
++pred_dist_log = []
+ for epoch in range(FLAGS.epochs):
+ 
+     t = time.time()
++    # Extract activations BEFORE the weight update, every 5 epochs plus
++    # epoch 1. The label epoch_<N> therefore means "after N completed
++    # epochs": epoch_0 is the untrained network, matching the KimCNN
++    # checkpoint convention (its epoch-0 checkpoint is saved before the
++    # training loop). The fully-trained snapshot is written after the loop
++    # as epoch_<FLAGS.epochs>.
++    if epoch % 5 == 0 or epoch == 1:
++        extract_activations(features, support, y_train, placeholders, train_mask, test_mask, out_dir=FLAGS.activations_dir)
++
++    lr = cosine_lr(epoch, FLAGS.epochs, FLAGS.learning_rate)
+     # Construct feed dictionary
+     feed_dict = construct_feed_dict(
+         features, support, y_train, train_mask, placeholders)
+     feed_dict.update({placeholders['dropout']: FLAGS.dropout})
++    feed_dict.update({placeholders['learning_rate']: lr})
+ 
+-    # Training step
++    # Training step. model.pred is argmax over the GCN's full output --
++    # used downstream to track the per-epoch class-prediction distribution
++    # on training nodes, which makes the early-training "dip" (collapse to
++    # majority class, then over-correction) visible separately from the
++    # smoothly-decreasing cross-entropy loss.
+     outs = sess.run([model.opt_op, model.loss, model.accuracy,
+-                     model.layers[0].embedding], feed_dict=feed_dict)
+-
+-    # Validation
+-    cost, acc, pred, labels, duration = evaluate(
+-        features, support, y_val, val_mask, placeholders)
+-    cost_val.append(cost)
+-
+-    print("Epoch:", '%04d' % (epoch + 1), "train_loss=", "{:.5f}".format(outs[1]),
+-          "train_acc=", "{:.5f}".format(
+-              outs[2]), "val_loss=", "{:.5f}".format(cost),
+-          "val_acc=", "{:.5f}".format(acc), "time=", "{:.5f}".format(time.time() - t))
+-
+-    if epoch > FLAGS.early_stopping and cost_val[-1] > np.mean(cost_val[-(FLAGS.early_stopping+1):-1]):
+-        print("Early stopping...")
+-        break
++                     model.layers[0].embedding, model.pred],
++                    feed_dict=feed_dict)
++
++    train_acc_log.append(outs[2])
++    # Per-epoch argmax-class histogram over train nodes only. Cheap: one
++    # row of num_classes ints per epoch -> ~tens of KB total.
++    train_preds = outs[4][np.asarray(train_mask, dtype=bool)]
++    pred_dist_log.append(
++        np.bincount(train_preds, minlength=y_train.shape[1]))
++
++    print("Epoch:", '%04d' % (epoch + 1), "lr=", "{:.5f}".format(lr),
++          "train_loss=", "{:.5f}".format(outs[1]),
++          "train_acc=", "{:.5f}".format(outs[2]),
++          "time=", "{:.5f}".format(time.time() - t))
++
++# Fully-trained snapshot: with the before-update extraction above, the
++# in-loop dumps end at the state after FLAGS.epochs - 5 epochs, so the
++# final state is always written here as epoch_<FLAGS.epochs>.
++epoch = FLAGS.epochs
++extract_activations(features, support, y_train, placeholders, train_mask, test_mask, out_dir=FLAGS.activations_dir)
+ 
+ print("Optimization Finished!")
++os.makedirs(FLAGS.activations_dir, exist_ok=True)
++with open(os.path.join(FLAGS.activations_dir, dataset + '_train_acc.txt'), 'w') as f:
++    for v in train_acc_log:
++        f.write(f'{v}\n')
++
++# (epochs, num_classes) array of train-node argmax-class counts per epoch.
++np.savetxt(
++    os.path.join(FLAGS.activations_dir, dataset + '_pred_dist.csv'),
++    np.stack(pred_dist_log, axis=0), fmt='%d', delimiter=',')
+ 
+ # Testing
+ test_cost, test_acc, pred, labels, test_duration = evaluate(
+@@ -141,6 +263,17 @@ test_cost, test_acc, pred, labels, test_duration = evaluate(
+ print("Test set results:", "cost=", "{:.5f}".format(test_cost),
+       "accuracy=", "{:.5f}".format(test_acc), "time=", "{:.5f}".format(test_duration))
+ 
++# Machine-readable result line (grep '^RESULT: ' on the logs). `outs` is the
++# training-loop output from the final epoch: outs[1]=train_loss, outs[2]=train_acc.
++print(
++    "RESULT: "
++    f"dataset={FLAGS.dataset}, hidden1={FLAGS.hidden1}, "
++    f"learning_rate={FLAGS.learning_rate}, weight_decay={FLAGS.weight_decay}, "
++    f"epochs={FLAGS.epochs}, num_layers={FLAGS.num_layers}, "
++    f"train_loss_final={float(outs[1]):.5f}, train_acc_final={float(outs[2]):.5f}, "
++    f"test_loss={test_cost:.5f}, test_acc={test_acc:.5f}",
++    flush=True)
++
+ test_pred = []
+ test_labels = []
+ print(len(test_mask))
+@@ -201,3 +334,10 @@ doc_embeddings_str = '\n'.join(doc_vectors)
+ f = open('data/' + dataset + '_doc_vectors.txt', 'w')
+ f.write(doc_embeddings_str)
+ f.close()
++
++# save labels file for processing of activations later
++import shutil
++shutil.copyfile('data/corpus/' + dataset + '_labels.txt',
++                os.path.join(FLAGS.activations_dir, dataset + '_labels.txt'))
++shutil.copyfile('data/' + dataset + '_shuffle.txt',
++                os.path.join(FLAGS.activations_dir, dataset + '_shuffle.txt'))
+diff --git a/utils.py b/utils.py
+index d22ee6b..bc63662 100644
+--- a/utils.py
++++ b/utils.py
+@@ -2,7 +2,7 @@ import numpy as np
+ import pickle as pkl
+ import networkx as nx
+ import scipy.sparse as sp
+-from scipy.sparse.linalg.eigen.arpack import eigsh
++from scipy.sparse.linalg import eigsh
+ import sys
+ import re
+ 
+@@ -19,7 +19,7 @@ def sample_mask(idx, l):
+     """Create mask."""
+     mask = np.zeros(l)
+     mask[idx] = 1
+-    return np.array(mask, dtype=np.bool)
++    return np.array(mask, dtype=bool)
+ 
+ 
+ def load_data(dataset_str):
